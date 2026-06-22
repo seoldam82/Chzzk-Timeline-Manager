@@ -263,7 +263,7 @@ AI 행동 지침
 
 ---
 
-## FFmpeg 설치
+## [FFmpeg 설치](https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip)
 
 ```bash
 ffmpeg -version
