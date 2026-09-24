@@ -1,4 +1,4 @@
-# 치지직 타임라인 매니저 (Chzzk-Timeline-Manager)
+﻿# 치지직 타임라인 매니저 (Chzzk-Timeline-Manager)
 
 치지직(CHZZK) 다시보기(VOD)의 음성 데이터와 실시간 채팅 화력을 분석하여, ChatGPT 구독으로 로그인한 Codex 기반 하이라이트 타임라인 초안을 생성하는 도구입니다. 생성 결과를 직접 수정한 뒤 치지직에 게시할 수 있습니다.
 
@@ -36,6 +36,7 @@
 ## 🎵 VOD 오디오 및 채팅 수집
 
 * yt-dlp 기반 고속 오디오 다운로드
+* yt-dlp 실패 시 CHZZK 공식 playback API로 직접 오디오 스트림 조회, 그래도 실패하면 `ChzzkVideoDownloader.exe`(CLI)로 최종 폴백하는 3단계 구조
 * 다운로드 캐싱 지원
 * 치지직 채팅 전체 로그 저장
 * 특정 구간(%)만 선택 분석 가능
@@ -340,6 +341,19 @@ python Main.py
 
 ---
 
+# 🕓 버전 기록
+
+## v3.0.0
+
+* AI 엔진 교체: Gemini API → **Codex CLI** (`codex login`으로 ChatGPT 구독 계정 로그인, API 키 불필요)
+* 댓글 자동 등록 기능 제거: 타임라인은 `TL_VOD_...txt` 초안 파일로 저장되고 기본 편집기로 자동 오픈, 직접 검토 후 수동 게시
+* 오디오 다운로드 3단계 폴백 구조 도입 (yt-dlp → CHZZK API → `ChzzkVideoDownloader.exe`)
+* 영상 길이 조회도 yt-dlp 실패 시 CHZZK API로 자동 대체
+
+전체 변경 내역은 [Releases](https://github.com/seoldam82/Chzzk-Timeline-Manager/releases)에서 확인할 수 있습니다.
+
+---
+
 # 📜 라이센스 및 면책사항
 
 본 프로젝트는 개인 편의를 위한 비공식 자동화 도구입니다.
@@ -347,3 +361,4 @@ python Main.py
 NAVER 및 CHZZK와 제휴 관계가 없으며, 댓글 내용·저작권·플랫폼 정책 위반 등에 대한 책임은 사용자 본인에게 있습니다.
 
 ---
+
