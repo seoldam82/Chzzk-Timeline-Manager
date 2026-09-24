@@ -128,8 +128,6 @@ CLI 인터페이스 및 전체 실행 흐름 담당
 * 채팅 수집
 * 채팅 정제
 * 화력 분석
-* 브라우저 쿠키 탐색
-* VOD 조회 및 채팅 수집
 
 ---
 
@@ -147,8 +145,6 @@ CLI 인터페이스 및 전체 실행 흐름 담당
 {
     "TARGET_CHANNEL_ID": "치지직_32자리_채널_해시값",
     "CODEX_MODEL": "",
-    "NID_AUT": "네이버 쿠키에서 추출한 고유 인증 토큰 1",
-    "NID_SES": "네이버 쿠키에서 추출한 세션 인증 토큰 2",
     "WHISPER_LANGUAGE": "ko",
     "WHISPER_MODEL": "base"
 }
@@ -174,13 +170,6 @@ CLI 인터페이스 및 전체 실행 흐름 담당
 4. `codex login status`로 로그인 상태를 확인합니다.
 
 `CODEX_MODEL`을 빈 문자열로 두면 Codex CLI의 기본 모델을 사용합니다. 특정 모델이 구독 계정에서 제공되는 경우에만 모델 이름을 지정하세요. API 키는 필요하지 않습니다.
-
-### 쿠키 추출 방법
-
-1. 네이버 또는 치지직 로그인합니다.
-2. F12 → Application → Cookies
-3. `https://chzzk.naver.com`
-4. `NID_AUT`, `NID_SES` 값 복사합니다.
 
 ---
 
@@ -241,8 +230,6 @@ AI 행동 지침
 ---
 
 # 🛠️ 설치 방법
-
-## .bat에 있는 Chzzk-Timeline-Manager.zip 설치하셔도 됩니다.
 
 ## Python 설치
 
