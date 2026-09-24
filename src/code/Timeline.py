@@ -6,15 +6,15 @@ import subprocess
 import re
 import time
 import glob
+import shutil
+import tempfile
+import requests
 from datetime import datetime, timedelta
 from yt_dlp import YoutubeDL
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional
 
-os.environ["OMP_NUM_THREADS"] = "8" 
+os.environ["OMP_NUM_THREADS"] = "8"
 os.environ["MKL_NUM_THREADS"] = "8"
 
 try:
@@ -45,17 +45,14 @@ try:
                     except: pass
                     if bin_path not in os.environ["PATH"]:
                         os.environ["PATH"] = bin_path + os.pathsep + os.environ["PATH"]
-                    
+
 except Exception as dll_error:
     print(f"⚠️ DLL 디렉토리 자동 등록 중 오류 발생: {dll_error}")
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 CONFIG_FILE = "config.json"
-GEMINI_MODEL = "gemini-3.1-flash-lite"      
-TEMPERATURE = 0.2  
-MAX_OUTPUT_TOKENS = 4000             
-TOP_P = 0.95                          
+CODEX_TIMEOUT_SECONDS = 900
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
 
@@ -65,7 +62,18 @@ FFMPEG_BIN_DIR = os.path.dirname(FFMPEG_PATH)
 if os.path.exists(FFMPEG_BIN_DIR) and FFMPEG_BIN_DIR not in os.environ["PATH"]:
     os.environ["PATH"] = FFMPEG_BIN_DIR + os.pathsep + os.environ["PATH"]
 
+CHZZK_DOWNLOADER_PATH = os.path.join(
+    PROJECT_ROOT, "tools", "chzzk", "ChzzkVideoDownloader.exe"
+)
+CHZZK_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://chzzk.naver.com/",
+    "Origin": "https://chzzk.naver.com",
+}
+
 class TimelineItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     group_large: str = Field(
         description="방송 상황의 대분류이자 대주제 (예: 저스트 채팅, 게임 방송, 공지사항, 영도 시청 등)"
     )
@@ -92,7 +100,74 @@ class TimelineItem(BaseModel):
     )
 
 class TimelineResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     items: List[TimelineItem] = Field(description="추출된 방송 타임라인 조각 리스트")
+
+
+def run_codex(prompt: str, model: str = "", output_schema: Optional[dict] = None) -> str:
+    """로그인된 Codex CLI를 비대화형으로 실행하고 최종 응답만 반환한다."""
+    codex_command = shutil.which("codex")
+    if not codex_command:
+        raise RuntimeError(
+            "Codex CLI를 찾을 수 없습니다. 먼저 Codex CLI를 설치한 뒤 "
+            "'codex login'으로 ChatGPT 구독 계정에 로그인하세요."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="chzzk_codex_") as temp_dir:
+        output_path = os.path.join(temp_dir, "response.txt")
+        command = [
+            codex_command, "exec", "--ephemeral", "--sandbox", "read-only",
+            "--skip-git-repo-check", "--color", "never",
+            "--output-last-message", output_path,
+        ]
+        if model:
+            command.extend(["--model", model])
+        if output_schema is not None:
+            schema_path = os.path.join(temp_dir, "schema.json")
+            with open(schema_path, "w", encoding="utf-8") as schema_file:
+                json.dump(output_schema, schema_file, ensure_ascii=False)
+            command.extend(["--output-schema", schema_path])
+        command.append("-")
+
+        result = subprocess.run(
+            command, input=prompt, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=temp_dir,
+            timeout=CODEX_TIMEOUT_SECONDS, check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(detail[-1500:] or f"Codex CLI 종료 코드: {result.returncode}")
+        if not os.path.exists(output_path):
+            raise RuntimeError("Codex CLI가 최종 응답 파일을 생성하지 않았습니다.")
+        with open(output_path, "r", encoding="utf-8") as output_file:
+            response_text = output_file.read().strip()
+        if not response_text:
+            raise RuntimeError("Codex CLI 응답이 비어 있습니다.")
+        return response_text
+
+
+def ensure_codex_ready() -> None:
+    """Codex CLI 설치 및 로그인 상태를 실제 분석 전에 확인한다."""
+    codex_command = shutil.which("codex")
+    if not codex_command:
+        raise RuntimeError(
+            "Codex CLI를 찾을 수 없습니다. 'npm install -g @openai/codex'로 설치한 뒤 "
+            "'codex login'을 실행하세요."
+        )
+    status = subprocess.run(
+        [codex_command, "login", "status"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout).strip()
+        raise RuntimeError(detail or "Codex에 로그인되어 있지 않습니다. 'codex login'을 실행하세요.")
 
 
 def timestamp_to_seconds(ts_str: str) -> int:
@@ -116,8 +191,8 @@ def load_config():
             "TARGET_CHANNEL_ID": "채널_ID_입력",
             "CHZZK_CLIENT_ID": "YOUR_CHZZK_CLIENT_ID",
             "CHZZK_CLIENT_SECRET": "YOUR_CHZZK_CLIENT_SECRET",
-            "GEMINI_API_KEY": "YOUR_GEMINI_API_KEY",
-            "WHISPER_MODEL": "base" 
+            "CODEX_MODEL": "",
+            "WHISPER_MODEL": "base"
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(default_config, f, indent=4, ensure_ascii=False)
@@ -127,11 +202,11 @@ def load_config():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             config = json.load(f)
-        
+
         return (
-            config.get("TARGET_CHANNEL_ID", "").strip(), 
-            config.get("GEMINI_API_KEY", "").strip(),
-            config.get("WHISPER_MODEL", "base").strip() 
+            config.get("TARGET_CHANNEL_ID", "").strip(),
+            config.get("CODEX_MODEL", "").strip(),
+            config.get("WHISPER_MODEL", "base").strip()
         )
     except Exception as e:
         print(f"❌ [JSON 파싱 실패] config.json 파일을 읽는 중 오류 발생: {e}")
@@ -153,18 +228,132 @@ def sanitize_chzzk_url(url: str) -> str:
             url = actual_url
     return url.strip().replace("'", "").replace('"', '')
 
+def _extract_chzzk_video_id(chzzk_url):
+    match = re.search(r"/video/(\d+)", sanitize_chzzk_url(chzzk_url))
+    return match.group(1) if match else ""
+
+
+def _get_chzzk_video_info(vod_id):
+    last_error = None
+    for api_version in ("v3", "v2"):
+        try:
+            response = requests.get(
+                f"https://api.chzzk.naver.com/service/{api_version}/videos/{vod_id}",
+                headers=CHZZK_HEADERS,
+                timeout=30,
+            )
+            response.raise_for_status()
+            content = response.json().get("content")
+            if content:
+                return content
+        except Exception as error:
+            last_error = error
+    raise RuntimeError(f"CHZZK VOD API 조회 실패: {last_error}")
+
+
 def get_video_duration(chzzk_url):
     chzzk_url = sanitize_chzzk_url(chzzk_url)
-    ydl_opts = {'quiet': True, 'nocheckcertificate': True}
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(chzzk_url, download=False)
-        return info.get('duration', 0)
+    try:
+        ydl_opts = {'quiet': True, 'nocheckcertificate': True}
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(chzzk_url, download=False)
+            duration = info.get('duration', 0)
+            if duration:
+                return duration
+    except Exception as error:
+        print(f"⚠️ yt-dlp 메타데이터 조회 실패: {error}")
+
+    vod_id = _extract_chzzk_video_id(chzzk_url)
+    if not vod_id:
+        return 0
+
+    try:
+        return int(_get_chzzk_video_info(vod_id).get("duration", 0))
+    except Exception as error:
+        print(f"⚠️ CHZZK API 메타데이터 조회 실패: {error}")
+        return 0
+
+
+def _download_chzzk_api_audio(chzzk_url, vod_id, output_path, ffmpeg_bin):
+    video_info = _get_chzzk_video_info(str(vod_id))
+    video_id = video_info.get("videoId")
+    in_key = video_info.get("inKey")
+    if not video_id or not in_key:
+        raise RuntimeError("CHZZK playback 정보(videoId/inKey)가 없습니다.")
+
+    playback_response = requests.get(
+        f"https://apis.naver.com/neonplayer/vodplay/v1/playback/{video_id}",
+        params={"key": in_key},
+        headers=CHZZK_HEADERS,
+        timeout=30,
+    )
+    playback_response.raise_for_status()
+    playback = playback_response.json()
+
+    audio_representations = []
+    for adaptation in playback.get("period", [{}])[0].get("adaptationSet", []):
+        if adaptation.get("mimeType") == "audio/mp4":
+            audio_representations.extend(adaptation.get("representation", []))
+
+    if not audio_representations:
+        raise RuntimeError("CHZZK playback 응답에서 오디오 스트림을 찾지 못했습니다.")
+
+    best = max(audio_representations, key=lambda item: item.get("bandwidth", 0))
+    base_url = best.get("baseURL", [])
+    if isinstance(base_url, list):
+        base_url = base_url[0] if base_url else ""
+    if isinstance(base_url, dict):
+        base_url = base_url.get("value", "")
+    if not base_url:
+        raise RuntimeError("CHZZK 오디오 스트림 URL이 없습니다.")
+
+    command = [
+        ffmpeg_bin, "-y", "-i", base_url,
+        "-vn", "-c:a", "copy", "-f", "mpegts", output_path,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    if result.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"CHZZK API 오디오 다운로드 실패: {result.stderr[-500:]}")
+
+
+def _download_chzzk_cli_video(chzzk_url, vod_dir, ffmpeg_bin, output_path):
+    if not os.path.exists(CHZZK_DOWNLOADER_PATH):
+        raise FileNotFoundError(f"CHZZK downloader가 없습니다: {CHZZK_DOWNLOADER_PATH}")
+
+    cli_dir = os.path.join(vod_dir, "chzzk_cli_download")
+    os.makedirs(cli_dir, exist_ok=True)
+    result = subprocess.run(
+        [CHZZK_DOWNLOADER_PATH, "-y", "-q", "1080p", "--out", cli_dir, chzzk_url],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"CHZZK CLI 다운로드 실패: {result.stderr[-500:]}")
+
+    video_files = [
+        path for path in glob.glob(os.path.join(cli_dir, "**", "*"), recursive=True)
+        if os.path.isfile(path) and os.path.splitext(path)[1].lower() in
+        {".mp4", ".mkv", ".ts", ".webm", ".mov"}
+    ]
+    if not video_files:
+        raise RuntimeError("CHZZK CLI가 다운로드한 영상 파일을 찾지 못했습니다.")
+
+    source_video = max(video_files, key=os.path.getsize)
+    command = [
+        ffmpeg_bin, "-y", "-i", source_video,
+        "-vn", "-c:a", "copy", "-f", "mpegts", output_path,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    if result.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"CHZZK CLI 영상 오디오 추출 실패: {result.stderr[-500:]}")
 
 
 def download_chzzk_vod_audio(chzzk_url, vod_id, output_filename="full_vod_audio"):
     chzzk_url = sanitize_chzzk_url(chzzk_url)
     specific_palette_dir = os.path.join(os.getcwd(), "voicepalette", f"VOD_{vod_id}")
-    
+
     try:
         os.makedirs(specific_palette_dir, exist_ok=True)
     except PermissionError:
@@ -173,9 +362,9 @@ def download_chzzk_vod_audio(chzzk_url, vod_id, output_filename="full_vod_audio"
     except Exception as e:
         print(f"❌ [폴더 생성 실패] {e}")
         return ""
-    
+
     master_audio_ts = os.path.join(specific_palette_dir, f"{output_filename}.ts")
-    
+
     if os.path.exists(master_audio_ts) and os.path.getsize(master_audio_ts) > 102400:
         print(f"✨ [오디오 캐시 적중] 전체 원본 TS 파일 로드 완료: {master_audio_ts}")
         return master_audio_ts
@@ -188,7 +377,7 @@ def download_chzzk_vod_audio(chzzk_url, vod_id, output_filename="full_vod_audio"
         return ""
 
     print(f"\n📡 [최초 1회 실행] 멀티스레드 오디오 수집 개시...")
-    
+
     ydl_opts = {
         'format': 'bestaudio/worst',
         'outtmpl': master_audio_ts,
@@ -196,12 +385,12 @@ def download_chzzk_vod_audio(chzzk_url, vod_id, output_filename="full_vod_audio"
         'nocheckcertificate': True,
         'noplaylist': True,
         'concurrent_fragment_downloads': 16,
-        'socket_timeout': 60,  
+        'socket_timeout': 60,
         'retries': 20,
         'fragment_retries': 30,
         'skip_unavailable_fragments': True,
-        'http_chunk_size': 5242880,  
-        'ffmpeg_location': ffmpeg_bin, 
+        'http_chunk_size': 5242880,
+        'ffmpeg_location': ffmpeg_bin,
         'fixup': 'never',
         'postprocessors': [],
     }
@@ -217,7 +406,7 @@ def download_chzzk_vod_audio(chzzk_url, vod_id, output_filename="full_vod_audio"
         found_files = []
         for ext in extensions:
             found_files.extend(glob.glob(os.path.join(specific_palette_dir, f"{output_filename}{ext}")))
-        
+
         if found_files:
             downloaded_file = found_files[0]
             if not downloaded_file.endswith('.ts'):
@@ -229,6 +418,20 @@ def download_chzzk_vod_audio(chzzk_url, vod_id, output_filename="full_vod_audio"
                 subprocess.run(cmd_convert, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 try: os.remove(downloaded_file)
                 except: pass
+
+    if not os.path.exists(master_audio_ts):
+        try:
+            print("📡 yt-dlp 실패 → CHZZK playback API 직접 오디오 다운로드를 시도합니다.")
+            _download_chzzk_api_audio(chzzk_url, vod_id, master_audio_ts, ffmpeg_bin)
+        except Exception as error:
+            print(f"⚠️ CHZZK API 오디오 다운로드 실패: {error}")
+
+    if not os.path.exists(master_audio_ts):
+        try:
+            print("📡 API 실패 → ChzzkVideoDownloader CLI fallback을 시도합니다.")
+            _download_chzzk_cli_video(chzzk_url, specific_palette_dir, ffmpeg_bin, master_audio_ts)
+        except Exception as error:
+            print(f"⚠️ ChzzkVideoDownloader fallback 실패: {error}")
 
     if not os.path.exists(master_audio_ts) or os.path.getsize(master_audio_ts) < 1024:
         print("❌ 원본 오디오 TS 마스터 스트림 파일 생성 실패.")
@@ -252,7 +455,7 @@ def transcribe_chzzk_audio(audio_path, target_path, model_size="base"):
     specific_palette_dir = os.path.dirname(target_path)
     chunk_pattern = os.path.join(specific_palette_dir, "temp_chunk_%03d.ts")
     chunk_length_sec = 3600
-    
+
     for f in glob.glob(os.path.join(specific_palette_dir, "temp_chunk_*.ts")):
         try: os.remove(f)
         except: pass
@@ -264,7 +467,7 @@ def transcribe_chzzk_audio(audio_path, target_path, model_size="base"):
         '-acodec', 'copy', chunk_pattern
     ]
     subprocess.run(cmd_split, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
+
     chunk_files = sorted(glob.glob(os.path.join(specific_palette_dir, "temp_chunk_*.ts")))
     if not chunk_files:
         print("❌ 분할된 오디오 청크 파일이 존재하지 않습니다.")
@@ -274,11 +477,11 @@ def transcribe_chzzk_audio(audio_path, target_path, model_size="base"):
 
     try:
         from faster_whisper import WhisperModel
-        NUM_CPUS = 8 
+        NUM_CPUS = 8
         try:
             model = WhisperModel(
-                model_size, 
-                device="cuda", 
+                model_size,
+                device="cuda",
                 compute_type="float16",
                 download_root=weights_dir
             )
@@ -286,27 +489,27 @@ def transcribe_chzzk_audio(audio_path, target_path, model_size="base"):
         except Exception as gpu_error:
             print(f"⚠️ GPU 로드 실패 ({gpu_error}). CPU 최적화 모드로 전환합니다.")
             model = WhisperModel(
-                model_size, 
-                device="cpu", 
+                model_size,
+                device="cpu",
                 compute_type="int8",
                 cpu_threads=NUM_CPUS,
                 download_root=weights_dir
             )
             print(f"🐌 [CPU 전환 완료] {NUM_CPUS}개 스레드를 활용해 최적화된 대본 추출을 진행합니다. (모델 저장 위치: {weights_dir})")
-            
+
     except ImportError:
         print("❌ faster-whisper 라이브러리가 설치되어 있지 않습니다.")
         return ""
 
     script_lines = []
-    
+
     for idx, chunk_file in enumerate(chunk_files):
         if os.path.getsize(chunk_file) < 1024:
             continue
-            
+
         current_offset_secs = idx * chunk_length_sec
         print(f"🎙️ [{idx+1}/{len(chunk_files)}] 청크 전사 연산 진행 중: {os.path.basename(chunk_file)}")
-        
+
         segments, info = model.transcribe(
             chunk_file,
             language="ko",
@@ -325,19 +528,19 @@ def transcribe_chzzk_audio(audio_path, target_path, model_size="base"):
             no_speech_threshold=0.5,
             log_prob_threshold=-1.0
         )
-        
+
         for segment in segments:
             absolute_secs = max(0, int(segment.start) + current_offset_secs - 1)
             h = absolute_secs // 3600
             m = (absolute_secs % 3600) // 60
             s = absolute_secs % 60
-            
+
             timestamp_str = f"[{h:02d}:{m:02d}:{s:02d}]"
             text_content = segment.text.strip()
-            
+
             if text_content:
                 script_lines.append(f"{timestamp_str} {text_content}")
-                print(f"  {timestamp_str} {text_content}") 
+                print(f"  {timestamp_str} {text_content}")
 
     for chunk_file in chunk_files:
         try: os.remove(chunk_file)
@@ -346,7 +549,7 @@ def transcribe_chzzk_audio(audio_path, target_path, model_size="base"):
     raw_script = "\n".join(script_lines)
     with open(target_path, "w", encoding="utf-8") as f:
         f.write(raw_script)
-        
+
     print(f"✅ 원본 오프셋 전체 생대본 보관 완료! (보존 경로: {target_path})")
     return raw_script
 
@@ -395,10 +598,10 @@ def load_and_filter_streamers_db(input_script, streamers_db_path="chzzk_streamer
     raw_db = load_chzzk_streamers_raw_db(streamers_db_path)
     if not raw_db:
         return []
-    
+
     EXCLUDE_KEYWORDS = {
-        "나는", "니야", "반", "뱅", "아야", "연", "이", "이다", "하네", "하세", 
-        "나", "너", "우리", "그거", "이거", "저거", "했다", "한다", "형", "님", 
+        "나는", "니야", "반", "뱅", "아야", "연", "이", "이다", "하네", "하세",
+        "나", "너", "우리", "그거", "이거", "저거", "했다", "한다", "형", "님",
         "아니", "진짜", "그냥", "오늘", "지금", "아이", "하나", "사람", "방송"
     }
 
@@ -406,10 +609,10 @@ def load_and_filter_streamers_db(input_script, streamers_db_path="chzzk_streamer
         line_strip = line.strip()
         if not line_strip or line_strip.startswith("#"):
             continue
-            
+
         if ":" in line_strip:
             line_strip = line_strip.split(":")[1].strip()
-            
+
         tokens = re.split(r'[,\s/]+', line_strip)
         for token in tokens:
             token_cleaned = token.strip()
@@ -425,21 +628,21 @@ def load_and_filter_streamers_db(input_script, streamers_db_path="chzzk_streamer
     if has_collab_context:
         for streamer_name in registered_streamers:
             if streamer_name == target_streamer:
-                continue 
-                
+                continue
+
             count = len(re.findall(re.escape(streamer_name), input_script))
-            if count >= 3:  
+            if count >= 3:
                 detected_members[streamer_name] = count
 
     return list(detected_members.keys())
 
-def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제목", chzzk_url="", api_key="", chunk_index=0):
+def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제목", chzzk_url="", codex_model="", chunk_index=0):
     chzzk_url = sanitize_chzzk_url(chzzk_url)
 
     prompt_path = os.path.join(os.getcwd(), "prompt.txt")
     streamer_info_path = os.path.join(os.getcwd(), "streamer_info.txt")
     streamers_db_path = "chzzk_streamers.txt"
-    
+
     target_streamer = parse_streamer_info_name(streamer_info_path)
     verified_collab_members = load_and_filter_streamers_db(input_script, streamers_db_path, target_streamer)
 
@@ -478,11 +681,11 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
     )
 
     system_prompt_content = base_instruction
-    
+
     if os.path.exists(prompt_path):
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_prompt_content += "\n=====[추가 편집 지침]=====\n" + f.read() + "\n"
-            
+
     if os.path.exists(streamer_info_path):
         with open(streamer_info_path, "r", encoding="utf-8") as f:
             system_prompt_content += "\n=====[스트리머 정보 레퍼런스]=====\n" + f.read()
@@ -499,32 +702,30 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
         f"[오디오 STT 데이터 원본]\n{input_script}\n\n"
         f"[시청자 실시간 채팅 데이터 원본]\n{chat_script}"
     )
-    
+
     max_retries = 5
-    retry_delay = 5  
+    retry_delay = 5
     response_json_text = ""
-    time.sleep(1.5)  
+    time.sleep(1.5)
 
     for attempt in range(max_retries):
         try:
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt_content,
-                    temperature=TEMPERATURE,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                    top_p=TOP_P,
-                    response_mime_type="application/json",
-                    response_schema=TimelineResponse,
-                )
+            response_json_text = run_codex(
+                prompt=(
+                    f"{system_prompt_content}\n\n=====[분석 대상 데이터]=====\n{user_content}\n\n"
+                    "반드시 지정된 JSON 스키마에 맞는 결과만 반환하십시오. "
+                    "파일을 읽거나 수정하거나 셸 명령을 실행하지 마십시오."
+                ),
+                model=codex_model,
+                output_schema=TimelineResponse.model_json_schema(),
             )
-            response_json_text = response.text.strip()
             if response_json_text:
                 break
         except Exception as e:
-            print(f"⚠️ API 연산 처리 재시도 대기 중... (시도: {attempt + 1}/{max_retries})")
+            print(
+                f"⚠️ Codex 호출 실패: {e} "
+                f"(시도: {attempt + 1}/{max_retries})"
+            )
             time.sleep(retry_delay)
 
     if not response_json_text:
@@ -559,7 +760,7 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
             current_secs = timestamp_to_seconds(ts)
             best_matched_sec = current_secs
             keyword_candidate = content_val[:4] if len(content_val) >= 4 else content_val
-            
+
             is_critical_moment = (wf >= 42 or "킬" in content_val or "승리" in content_val or "압살" in content_val or "클리어" in content_val or "전멸" in content_val)
             is_general_summary = (wi >= 35 and wf < 30)
 
@@ -578,10 +779,10 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
                         best_matched_sec = max(0.0, stt_sec - 3.0)
                     else:
                         best_matched_sec = max(0.0, stt_sec - 1.5)
-                    
+
                     matched_flag = True
                     break
-                        
+
             if not matched_flag:
                 for stt_sec, stt_text in streamer_stt_list:
                     if abs(current_secs - stt_sec) <= 5:
@@ -602,16 +803,16 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
             if best_matched_sec != current_secs:
                 ts = seconds_to_timestamp(int(best_matched_sec))
                 current_secs = int(best_matched_sec)
-            
+
             if current_secs > 1800:
-                if gl in ["오프닝", "방송시작", "방송 시작"]: 
+                if gl in ["오프닝", "방송시작", "방송 시작"]:
                     gl = "저스트 채팅"
                 if any(x in topic for x in ["시작", "오프닝", "인사"]):
                     topic = "방송 잡담 및 일상 공유"
-            
+
             if any(x in topic for x in ["소통", "시청자 리액션", "리액션", "티키타카"]):
                 topic = "방송 잡담 및 일상 공유"
-                
+
             if wf + wi >= 40 or wi >= 25:
                 cleaned_content = re.sub(r"\s*\(\s*\d+\s*단계\s*\)\s*", " ", content_val).strip()
                 cleaned_content = cleaned_content.replace("[채팅폭발]", "").strip()
@@ -622,7 +823,7 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
                     continue
 
                 cleaned_content = re.sub(r'ㅋ{4,}', 'ㅋㅋㅋ', cleaned_content).replace("전개.", "").replace("수행.", "").strip()
-                
+
                 raw_items.append({
                     "seconds": current_secs,
                     "timestamp": ts,
@@ -633,7 +834,7 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
 
     except Exception as parse_error:
         matches = re.findall(r'"group_large"\s*:\s*"([^"]+)"\s*,\s*"topic"\s*:\s*"([^"]+)"\s*,\s*"timestamp"\s*:\s*"([^"]+)"\s*,.*?,"content"\s*:\s*"([^"]+)"', response_json_text, re.DOTALL)
-        
+
         for gl, topic, ts, content_str in matches:
             gl_val = gl.strip()
             topic_val = re.sub(r"\(.*?\)", "", topic.strip()).strip()
@@ -652,7 +853,7 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
             current_secs = timestamp_to_seconds(ts_val)
             best_matched_sec = current_secs
             keyword_candidate = content_val[:4] if len(content_val) >= 4 else content_val
-            
+
             is_critical_moment = (content_val.find("킬") != -1 or content_val.find("승리") != -1 or content_val.find("압살") != -1 or content_val.find("클리어") != -1)
             is_general_summary = (topic_val.find("토크") != -1 or topic_val.find("공유") != -1 or topic_val.find("잡담") != -1)
 
@@ -673,7 +874,7 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
                         best_matched_sec = max(0.0, stt_sec - 1.5)
                     matched_flag = True
                     break
-            
+
             if not matched_flag:
                 for stt_sec, stt_text in streamer_stt_list:
                     if abs(current_secs - stt_sec) <= 5:
@@ -696,11 +897,11 @@ def generate_chzzk_timeline(input_script, chat_script="", actual_title="VOD제�
                 current_secs = int(best_matched_sec)
 
             if current_secs > 1800:
-                if gl_val in ["오프닝", "방송시작", "방송 시작"]: 
+                if gl_val in ["오프닝", "방송시작", "방송 시작"]:
                     gl_val = "저스트 채팅"
                 if any(x in topic_val for x in ["시작", "오프닝", "인사"]):
                     topic_val = "방송 잡담 및 일상 공유"
-            
+
             if any(x in topic_val for x in ["소통", "시청자 리액션", "리액션", "티키타카"]):
                 topic_val = "방송 잡담 및 일상 공유"
 
@@ -729,40 +930,40 @@ def merge_and_format_final_timeline(all_processed_items: list) -> str:
         return ""
 
     all_processed_items.sort(key=lambda x: x["seconds"])
-    historical_tags = []  
-    
+    historical_tags = []
+
     for item in all_processed_items:
         gl = item["group_large"]
         topic = item["topic"]
-        
+
         norm_gl = re.sub(r"\s+", "", gl).lower()
         norm_topic = re.sub(r"\s+", "", topic).lower()
         pure_topic = re.sub(r"\(.*?\)", "", norm_topic)
         if len(pure_topic) > 3:
             pure_topic = re.sub(r"(게임|방송|플레이|시청|토크|소통|진행|하기)$", "", pure_topic)
-            
+
         current_norm_key = f"{norm_gl};{pure_topic}"
         assigned_header = f"[{gl}; {topic}]"
-        
+
         for past_norm_key, past_header in reversed(historical_tags):
             past_gl, past_pure_topic = past_norm_key.split(";", 1)
-            
+
             if norm_gl == past_gl:
                 is_topic_similar = (pure_topic == past_pure_topic) or \
                                    (pure_topic in past_pure_topic and len(pure_topic) >= 3) or \
                                    (past_pure_topic in pure_topic and len(past_pure_topic) >= 3)
-                
+
                 if is_topic_similar:
                     if "시작" in past_header or "인사" in past_header:
                         if item["seconds"] > 1800:
                             break
-                            
-                    assigned_header = past_header  
+
+                    assigned_header = past_header
                     break
-                    
+
         if assigned_header == f"[{gl}; {topic}]":
             historical_tags.append((current_norm_key, assigned_header))
-            
+
         item["assigned_header"] = assigned_header
 
     final_output_lines = []
@@ -772,48 +973,48 @@ def merge_and_format_final_timeline(all_processed_items: list) -> str:
     for item in all_processed_items:
         header = item["assigned_header"]
         entry_text = f"[{item['timestamp']}] {item['content']}"
-        
+
         if entry_text in seen_entries:
             continue
         seen_entries.add(entry_text)
-        
+
         if header != current_active_header:
             if current_active_header is not None:
-                final_output_lines.append("")  
+                final_output_lines.append("")
             final_output_lines.append(header)
             current_active_header = header
-            
+
         final_output_lines.append(entry_text)
 
     return "\n".join(final_output_lines)
 
-def correct_streamer_nicknames_with_gemini(timeline_text: str, api_key: str, db_filename="chzzk_streamers.txt") -> str:
+def correct_streamer_nicknames_with_codex(timeline_text: str, codex_model: str = "", db_filename="chzzk_streamers.txt") -> str:
     streamers_db_content = load_chzzk_streamers_raw_db(db_filename)
-    
+
     lines = timeline_text.split("\n")
     processed_lines = []
     current_hour = 0
-    
+
     for line in lines:
         line_strip = line.strip()
         if not line_strip:
             processed_lines.append("")
             continue
-            
+
         match_ts = re.match(r"^\[(\d{2}):(\d{2}):(\d{2})\]", line_strip)
         if match_ts:
             current_hour = int(match_ts.group(1))
             if current_hour >= 1:
                 line_strip = re.sub(r"방송\s*시작\s*(인사|멘트)?", "방송 잡담 및 소통", line_strip)
                 line_strip = re.sub(r"라이브\s*방송\s*잡담", "방송 잡담", line_strip)
-        
+
         if line_strip.startswith("[") and ";" in line_strip and line_strip.endswith("]"):
             line_strip = re.sub(r"\([^)]+\)(?=\s*\])", "", line_strip).strip()
             if current_hour >= 1 and any(x in line_strip for x in ["방송 시작", "오프닝", "방송시작"]):
                 line_strip = "[저스트 채팅; 방송 잡담 및 일상 공유]"
-                    
+
         processed_lines.append(line_strip)
-        
+
     intermediate_text = "\n".join(processed_lines)
 
     system_instruction = (
@@ -834,18 +1035,13 @@ def correct_streamer_nicknames_with_gemini(timeline_text: str, api_key: str, db_
     )
 
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.1, 
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-                top_p=0.95,
-            )
+        corrected_text = run_codex(
+            prompt=(
+                f"{system_instruction}\n\n{user_prompt}\n\n"
+                "결과 텍스트만 반환하십시오. 파일을 읽거나 수정하거나 셸 명령을 실행하지 마십시오."
+            ),
+            model=codex_model,
         )
-        corrected_text = response.text.strip()
         if corrected_text:
             final_lines = []
             for line in corrected_text.split("\n"):
@@ -854,6 +1050,6 @@ def correct_streamer_nicknames_with_gemini(timeline_text: str, api_key: str, db_
                 final_lines.append(line)
             return "\n".join(final_lines)
     except Exception as e:
-        print(f"⚠️ [Gemini 연산 실패] AI 검수 중 오류가 발생하여 1차 구조 정리본을 반환합니다: {e}")
-    
+        print(f"⚠️ [Codex 연산 실패] AI 검수 중 오류가 발생하여 1차 구조 정리본을 반환합니다: {e}")
+
     return intermediate_text
