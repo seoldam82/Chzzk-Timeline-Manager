@@ -9,6 +9,7 @@ import glob
 import shutil
 import tempfile
 import requests
+import hashlib
 from datetime import datetime, timedelta
 from yt_dlp import YoutubeDL
 from pydantic import BaseModel, ConfigDict, Field
@@ -663,6 +664,225 @@ def load_and_filter_streamers_db(input_script, streamers_db_path="chzzk_streamer
 
     return list(detected_members.keys())
 
+
+def _normalize_streamer_name(value: str) -> str:
+    return re.sub(r"\s+", "", value or "").casefold()
+
+
+def _streamer_profile_paths(target_channel_id: str, profile_root: str = "") -> tuple[str, str]:
+    channel_id = (target_channel_id or "").strip()
+    if not re.fullmatch(r"[0-9A-Za-z_-]{1,128}", channel_id):
+        return "", ""
+    root = os.path.abspath(profile_root or os.path.join(os.getcwd(), "streamer_profiles"))
+    return (
+        os.path.join(root, f"{channel_id}.txt"),
+        os.path.join(root, f"{channel_id}.meta.json"),
+    )
+
+
+def _minimal_streamer_profile(target_channel_id: str, target_streamer: str) -> str:
+    return (
+        "[방송인 기본 정보]\n"
+        f"- 치지직 채널 ID: {(target_channel_id or '').strip() or '확인 불가'}\n"
+        f"- 스트리머 이름: {(target_streamer or '').strip() or '확인 불가'}"
+    )
+
+
+def _profile_name_from_text(profile_text: str) -> str:
+    for line in (profile_text or "").splitlines():
+        value = line.strip()
+        if not value or value.startswith("#") or (value.startswith("[") and value.endswith("]")):
+            continue
+        match = re.search(r"(?:스트리머\s*이름|방송인\s*이름|스트리머)\s*:\s*([^(/,]+)", value)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def load_streamer_profile(target_channel_id: str, target_streamer: str,
+                          profile_root: str = "") -> tuple[str, str]:
+    """Load only the profile addressed by the selected VOD's channel ID."""
+    channel_id = (target_channel_id or "").strip()
+    streamer_name = (target_streamer or "").strip()
+    profile_content = ""
+    profile_path, _ = _streamer_profile_paths(channel_id, profile_root)
+
+    if profile_path and os.path.isfile(profile_path):
+        try:
+            with open(profile_path, "r", encoding="utf-8") as profile_file:
+                candidate = profile_file.read().strip()
+            profile_name = _profile_name_from_text(candidate)
+            if (streamer_name and profile_name and
+                    _normalize_streamer_name(profile_name) == _normalize_streamer_name(streamer_name)):
+                profile_content = candidate
+            else:
+                print(f"⚠️ 채널 프로필 이름 불일치로 무시합니다: {profile_path}")
+        except (OSError, UnicodeError) as exc:
+            print(f"⚠️ 스트리머 프로필 읽기 실패: {profile_path} ({exc})")
+
+    if not profile_content:
+        profile_content = _minimal_streamer_profile(channel_id, streamer_name)
+    return streamer_name, profile_content
+
+
+def _atomic_write_profile_file(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=".streamer-profile-", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def _save_streamer_profile_cache(profile_path: str, metadata_path: str,
+                                 profile_text: str, metadata: dict) -> None:
+    paths = (profile_path, metadata_path)
+    previous = {}
+    for path in paths:
+        if os.path.isfile(path):
+            with open(path, "rb") as handle:
+                previous[path] = handle.read()
+    try:
+        _atomic_write_profile_file(profile_path, profile_text)
+        _atomic_write_profile_file(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2))
+    except OSError:
+        for path in paths:
+            try:
+                if path in previous:
+                    _atomic_write_profile_file(path, previous[path].decode("utf-8"))
+                elif os.path.exists(path):
+                    os.unlink(path)
+            except (OSError, UnicodeError):
+                pass
+        raise
+
+
+def _merge_preserved_user_profile(existing: str, official: str) -> str:
+    preserved = []
+    current_section = ""
+    section_lines = []
+
+    def preserve_current():
+        if current_section and current_section != "방송인 기본 정보" and section_lines:
+            preserved.append("\n".join(section_lines).strip())
+
+    for raw_line in (existing or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            preserve_current()
+            current_section = line[1:-1].strip()
+            section_lines = [line]
+        elif current_section:
+            section_lines.append(raw_line)
+    preserve_current()
+
+    official = (official or "").rstrip()
+    return official + ("\n\n" + "\n\n".join(preserved) if preserved else "")
+
+
+def research_streamer_profile(target_channel_id: str, target_streamer: str) -> tuple[str, dict]:
+    """Fetch official CHZZK channel details for one validated channel identity."""
+    channel_id = (target_channel_id or "").strip()
+    streamer_name = (target_streamer or "").strip()
+    if not _streamer_profile_paths(channel_id)[0] or not streamer_name:
+        return "", {}
+
+    source_url = f"https://api.chzzk.naver.com/service/v1/channels/{channel_id}"
+    try:
+        response = requests.get(
+            source_url,
+            headers={"User-Agent": "Chzzk-Timeline-Manager/1.0 profile-researcher",
+                     "Origin": "https://chzzk.naver.com", "Referer": f"https://chzzk.naver.com/{channel_id}"},
+            timeout=(5, 15),
+        )
+        if response.status_code != 200 or len(response.content) > 512 * 1024:
+            return "", {}
+        payload = response.json()
+        content = payload.get("content") if isinstance(payload, dict) else None
+        if not isinstance(content, dict):
+            return "", {}
+    except (requests.RequestException, ValueError, TypeError):
+        return "", {}
+
+    returned_channel_id = str(content.get("channelId") or "").strip()
+    fetched_name = str(content.get("channelName") or "").strip()
+    if (returned_channel_id != channel_id or not fetched_name or
+            _normalize_streamer_name(fetched_name) != _normalize_streamer_name(streamer_name)):
+        print("⚠️ 공식 채널 정보가 선택한 VOD의 채널 ID 또는 이름과 일치하지 않아 프로필 갱신을 중단합니다.")
+        return "", {}
+
+    profile_lines = [
+        "[방송인 기본 정보]",
+        f"- 치지직 채널 ID: {channel_id}",
+        f"- 스트리머 이름: {fetched_name}",
+    ]
+    description = str(content.get("channelDescription") or "").strip()[:4000]
+    if description:
+        profile_lines.append(f"- 공식 채널 설명: {description}")
+    profile_text = "\n".join(profile_lines)
+    metadata = {
+        "schema_version": 1,
+        "channel_id": channel_id,
+        "channel_name": fetched_name,
+        "fetched_at": datetime.now().astimezone().isoformat(),
+        "sources": [{"url": source_url, "type": "official_chzzk_api"}],
+        "profile_sha256": hashlib.sha256(profile_text.encode("utf-8")).hexdigest(),
+    }
+    return profile_text, metadata
+
+
+def prepare_streamer_profile(target_channel_id: str, target_streamer: str,
+                             profile_root: str = "") -> tuple[str, str]:
+    """Reuse or refresh the profile scoped to one selected VOD channel."""
+    channel_id = (target_channel_id or "").strip()
+    streamer_name = (target_streamer or "").strip()
+    profile_path, metadata_path = _streamer_profile_paths(channel_id, profile_root)
+    if not profile_path:
+        return streamer_name, _minimal_streamer_profile("", streamer_name)
+
+    has_cached_profile = os.path.isfile(profile_path)
+    try:
+        if has_cached_profile:
+            choice = input("스트리머 프로필: 기존 캐시 사용(Enter/y) / 이번 실행 미사용(n) / 공식 정보로 업데이트(update): ").strip().lower()
+        else:
+            choice = input("스트리머 프로필 캐시가 없습니다. 공식 정보 조사·생성(Enter/y) / 프로필 없이 진행(n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        choice = ""
+
+    if choice in {"n", "no"}:
+        print("ℹ️ 이번 실행에서는 스트리머 프로필을 사용하지 않습니다.")
+        return streamer_name, ""
+    if has_cached_profile and choice not in {"u", "update", "refresh"}:
+        return load_streamer_profile(channel_id, streamer_name, profile_root)
+
+    profile_text, metadata = research_streamer_profile(channel_id, streamer_name)
+    if (profile_text and metadata.get("channel_id") == channel_id and
+            _normalize_streamer_name(metadata.get("channel_name", "")) == _normalize_streamer_name(streamer_name)):
+        try:
+            with open(profile_path, "r", encoding="utf-8") as handle:
+                existing_profile = handle.read()
+        except FileNotFoundError:
+            existing_profile = ""
+        profile_text = _merge_preserved_user_profile(existing_profile, profile_text)
+        metadata["profile_sha256"] = hashlib.sha256(profile_text.encode("utf-8")).hexdigest()
+        try:
+            _save_streamer_profile_cache(profile_path, metadata_path, profile_text, metadata)
+            print(f"✅ 공식 치지직 정보 기반 스트리머 프로필 저장 완료: {profile_path}")
+            return streamer_name, profile_text
+        except OSError as exc:
+            print(f"⚠️ 스트리머 프로필 저장 실패: {exc}")
+
+    if has_cached_profile:
+        print("⚠️ 프로필 업데이트에 실패하여 기존 캐시를 사용합니다.")
+    else:
+        print("⚠️ 프로필 조사에 실패하여 프로필 없이 계속 진행합니다.")
+    return load_streamer_profile(channel_id, streamer_name, profile_root)
+
 def generate_chzzk_timeline(
     input_script,
     chat_script="",
@@ -672,12 +892,16 @@ def generate_chzzk_timeline(
     chunk_index=0,
     use_collab_member_reference=True,
     target_streamer="",
+    target_channel_id="",
+    streamer_profile_context=None,
 ):
     chzzk_url = sanitize_chzzk_url(chzzk_url)
 
     prompt_path = os.path.join(os.getcwd(), "prompt.txt")
-    streamer_info_path = os.path.join(os.getcwd(), "streamer_info.txt")
     streamers_db_path = "chzzk_streamers.txt"
+
+    if streamer_profile_context is None:
+        _, streamer_profile_context = load_streamer_profile(target_channel_id, target_streamer)
 
     verified_collab_members = []
     if use_collab_member_reference:
@@ -725,10 +949,6 @@ def generate_chzzk_timeline(
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_prompt_content += "\n=====[추가 편집 지침]=====\n" + f.read() + "\n"
 
-    if os.path.exists(streamer_info_path):
-        with open(streamer_info_path, "r", encoding="utf-8") as f:
-            system_prompt_content += "\n=====[스트리머 정보 레퍼런스]=====\n" + f.read()
-
     collab_member_reference = ""
     if use_collab_member_reference:
         collab_text_guide = ", ".join(verified_collab_members) if verified_collab_members else "없음"
@@ -746,6 +966,12 @@ def generate_chzzk_timeline(
         f"[오디오 STT 데이터 원본]\n{input_script}\n\n"
         f"[시청자 실시간 채팅 데이터 원본]\n{chat_script}"
     )
+
+    if streamer_profile_context.strip():
+        user_content = (
+            "=====[선택된 채널 프로필 참고 정보]=====\n"
+            f"{streamer_profile_context}\n=====[채널 프로필 끝]=====\n\n" + user_content
+        )
 
     max_retries = 5
     retry_delay = 5

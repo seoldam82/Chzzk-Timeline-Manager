@@ -23,6 +23,7 @@ from Timeline import (
     correct_streamer_nicknames_with_codex,
     ensure_codex_ready,
     load_chzzk_streamers_raw_db,
+    prepare_streamer_profile,
 )
 
 def parse_chat_timestamp_to_secs(chat_line):
@@ -236,15 +237,28 @@ def run_pure_test(timeline_only=False):
         print("❌ 올바른 숫자가 아닙니다. 기본값인 10개로 탐색을 시작합니다.")
         vod_limit = 10
 
-    vod_id, actual_title, video_duration, target_streamer = select_chzzk_vod(
+    selected_vod = select_chzzk_vod(
         TARGET_CHANNEL_ID,
         limit=vod_limit,
     )
+    if selected_vod and len(selected_vod) == 5:
+        vod_id, actual_title, video_duration, target_streamer, target_channel_id = selected_vod
+    elif selected_vod and len(selected_vod) == 4:
+        vod_id, actual_title, video_duration, target_streamer = selected_vod
+        target_channel_id = None
+    else:
+        print("❌ 유효한 치지직 VOD 일련번호를 획득하지 못했습니다.")
+        return
     if not vod_id:
         print("❌ 유효한 치지직 VOD 일련번호를 획득하지 못했습니다.")
         return
     if not target_streamer:
         print("⚠️ 선택한 VOD에서 채널명을 확인하지 못해 주인공 스트리머명을 비워 둡니다.")
+
+    target_streamer, streamer_profile_context = prepare_streamer_profile(
+        target_channel_id=target_channel_id,
+        target_streamer=target_streamer,
+    )
 
     full_vod_url = f"https://chzzk.naver.com/video/{vod_id}"
     print(f"\n🎬 선택된 타겟 방송: [{actual_title}] (VOD ID: {vod_id})")
@@ -341,6 +355,8 @@ def run_pure_test(timeline_only=False):
             chunk_index=chunk_index,
             use_collab_member_reference=use_collab_member_reference,
             target_streamer=target_streamer,
+            target_channel_id=target_channel_id,
+            streamer_profile_context=streamer_profile_context,
         )
 
         if chunk_items:

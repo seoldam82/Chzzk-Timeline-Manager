@@ -26,8 +26,12 @@ def load_main_module():
         "correct_streamer_nicknames_with_codex",
         "ensure_codex_ready",
         "load_chzzk_streamers_raw_db",
+        "prepare_streamer_profile",
     ):
         setattr(timeline, name, lambda *args, **kwargs: None)
+    timeline.prepare_streamer_profile = lambda target_channel_id="", target_streamer="", **kwargs: (
+        target_streamer, ""
+    )
 
     sys.modules["Chzzk_api"] = chzzk_api
     sys.modules["Timeline"] = timeline
@@ -148,6 +152,100 @@ class PreparedTimelineMaterialsTest(unittest.TestCase):
                 transcribe.call_args.kwargs["target_path"].endswith(
                     os.path.join("VOD_123", "raw_script_600_1200.txt")
                 )
+            )
+
+    def test_selected_channel_profile_is_prepared_once_and_reused_for_each_range_chunk(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = "[00:10:00] 첫 청크\n[01:10:00] 둘째 청크"
+            selected_channel_id = "selected-channel"
+            prepare_profile = mock.Mock(return_value=("채널명", "[방송인 기본 정보]\n채널 프로필"))
+            generate = mock.Mock(return_value=[{"seconds": 1}])
+            patches = (
+                mock.patch.object(self.main, "ensure_codex_ready"),
+                mock.patch.object(
+                    self.main, "select_chzzk_vod",
+                    return_value=("123", "테스트 VOD", 7200, "채널명", selected_channel_id),
+                ),
+                mock.patch.object(self.main, "prepare_streamer_profile", prepare_profile),
+                mock.patch.object(self.main, "ask_analysis_time_range", return_value=(0, 7200)),
+                mock.patch.object(self.main, "ask_use_collab_member_reference", return_value=False),
+                mock.patch.object(self.main, "load_prepared_timeline_materials", return_value=script),
+                mock.patch.object(self.main, "download_chzzk_vod_chats", return_value=""),
+                mock.patch.object(
+                    self.main, "timestamp_to_seconds",
+                    side_effect=lambda value: {"00:10:00": 600, "01:10:00": 4200}[value],
+                ),
+                mock.patch.object(self.main, "generate_chzzk_timeline", generate),
+                mock.patch.object(self.main, "merge_and_format_final_timeline", return_value="[00:00:01] 결과"),
+                mock.patch.object(
+                    self.main, "correct_streamer_nicknames_with_codex",
+                    side_effect=lambda timeline_text, **kwargs: timeline_text,
+                ),
+                mock.patch.object(self.main.os, "startfile", create=True),
+                mock.patch("builtins.input", return_value="1"),
+            )
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+                with contextlib.ExitStack() as stack:
+                    for active_patch in patches:
+                        stack.enter_context(active_patch)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.main.run_pure_test(timeline_only=True)
+            finally:
+                os.chdir(previous_cwd)
+
+            prepare_profile.assert_called_once_with(
+                target_channel_id=selected_channel_id, target_streamer="채널명"
+            )
+            self.assertEqual(2, generate.call_count)
+            for call in generate.call_args_list:
+                self.assertEqual(selected_channel_id, call.kwargs["target_channel_id"])
+                self.assertEqual("[방송인 기본 정보]\n채널 프로필", call.kwargs["streamer_profile_context"])
+            self.assertEqual([0, 1], [call.kwargs["chunk_index"] for call in generate.call_args_list])
+
+    def test_legacy_vod_result_does_not_use_requested_channel_as_profile_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = "[00:10:00] 첫 청크\n[01:10:00] 둘째 청크"
+            prepare_profile = mock.Mock(return_value=("채널명", "임시 프로필"))
+            patches = (
+                mock.patch.object(self.main, "ensure_codex_ready"),
+                mock.patch.object(self.main, "CONFIG", {"TARGET_CHANNEL_ID": "requested-channel"}),
+                mock.patch.object(
+                    self.main, "select_chzzk_vod",
+                    return_value=("123", "테스트 VOD", 7200, "채널명"),
+                ),
+                mock.patch.object(self.main, "prepare_streamer_profile", prepare_profile),
+                mock.patch.object(self.main, "ask_analysis_time_range", return_value=(0, 7200)),
+                mock.patch.object(self.main, "ask_use_collab_member_reference", return_value=False),
+                mock.patch.object(self.main, "load_prepared_timeline_materials", return_value=script),
+                mock.patch.object(self.main, "download_chzzk_vod_chats", return_value=""),
+                mock.patch.object(
+                    self.main, "timestamp_to_seconds",
+                    side_effect=lambda value: {"00:10:00": 600, "01:10:00": 4200}[value],
+                ),
+                mock.patch.object(self.main, "generate_chzzk_timeline", return_value=[{"seconds": 1}]),
+                mock.patch.object(self.main, "merge_and_format_final_timeline", return_value="[00:00:01] 결과"),
+                mock.patch.object(
+                    self.main, "correct_streamer_nicknames_with_codex",
+                    side_effect=lambda timeline_text, **kwargs: timeline_text,
+                ),
+                mock.patch.object(self.main.os, "startfile", create=True),
+                mock.patch("builtins.input", return_value="1"),
+            )
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+                with contextlib.ExitStack() as stack:
+                    for active_patch in patches:
+                        stack.enter_context(active_patch)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.main.run_pure_test(timeline_only=True)
+            finally:
+                os.chdir(previous_cwd)
+
+            prepare_profile.assert_called_once_with(
+                target_channel_id=None, target_streamer="채널명"
             )
 
 
